@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Resonance Nav — blind mage prototype</title>
+<style>
+  /* Mobile-first, no scroll, no default touch gestures. */
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: #0a0a12; color: #cfd3e0;
+    font-family: -apple-system, system-ui, sans-serif;
+    touch-action: none;            /* critical: no pan/zoom stealing our touches */
+    overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none;
+  }
+  #stage { position: fixed; inset: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* Debug HUD — sighted-developer only. The game is meant to be played eyes-closed. */
+  #hud {
+    position: absolute; left: 0; right: 0; top: 0;
+    padding: 10px 12px; font-size: 14px; line-height: 1.4;
+    pointer-events: none; text-shadow: 0 1px 2px #000;
+  }
+  #state { font-size: 18px; font-weight: 600; }
+  #health { color: #ff6b6b; letter-spacing: 2px; }
+  #meta { opacity: .6; font-size: 12px; }
+
+  /* Overlays (start / end) — these DO take pointer events (buttons). */
+  .overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: rgba(6,6,14,.92); text-align: center; padding: 24px;
+  }
+  .overlay h1 { font-size: 24px; font-weight: 700; }
+  .overlay p  { font-size: 14px; opacity: .75; max-width: 440px; }
+  .btn {
+    pointer-events: auto; cursor: pointer;
+    border: 1px solid #3a3f5a; background: #171b2e; color: #e8ebf5;
+    padding: 16px 28px; border-radius: 14px; font-size: 18px; font-weight: 600;
+  }
+  .btn:active { background: #232842; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  .btn.small { padding: 12px 18px; font-size: 15px; }
+  .hidden { display: none !important; }
+  .diff.active { border-color: #6ad19a; background: #16261d; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+
+  <!-- Debug HUD -->
+  <div id="hud">
+    <div id="state">—</div>
+    <div id="health">♥ ♥ ♥</div>
+    <div id="meta"></div>
+  </div>
+
+  <!-- START overlay: audio + vibration MUST be unlocked by a user gesture on mobile -->
+  <div id="startOverlay" class="overlay">
+    <h1>🎧 Resonance Nav</h1>
+    <p>Close your eyes. Hold a finger on the screen: the <b>angle</b> from centre to
+       your finger is your heading, the <b>distance</b> is your speed. Follow the pure
+       resonance tone to the goal; avoid the harsh hazard sounds. Headphones on.</p>
+    <div class="row" id="diffRow">
+      <button class="btn small diff" data-diff="easy">Easy</button>
+      <button class="btn small diff" data-diff="normal">Normal</button>
+      <button class="btn small diff" data-diff="hard">Hard</button>
+    </div>
+    <button class="btn" id="startBtn">Start</button>
+    <p style="font-size:12px">Tip: works best with headphones so stereo pan is obvious.</p>
+  </div>
+
+  <!-- END overlay -->
+  <div id="endOverlay" class="overlay hidden">
+    <h1 id="endTitle">—</h1>
+    <p id="endMsg"></p>
+    <button class="btn" id="retryBtn">Retry</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* =========================================================================
+   RESONANCE NAV — audio-first navigation prototype
+   -------------------------------------------------------------------------
+   A blind mage follows a continuous magical resonance tone to a goal while
+   avoiding hazards, guided by STEREO AUDIO + HAPTICS. Visuals are debug-only.
+
+   Modules (kept deliberately separate for a later Unity port):
+     CONFIG   — every tunable value, at the very top.
+     Input    — finger-joystick -> desired movement vector (swap for tilt later).
+     Audio    — Web Audio synthesis (placeholder oscillators; swap for samples).
+     Haptics  — navigator.vibrate scheduler (swap for Unity variable-intensity).
+     Game     — state, update loop, rules, debug rendering.
+   ========================================================================= */
+
+
+/* =========================================================================
+   1) CONFIG  — TUNE EVERYTHING HERE.
+   The values flagged ★ are the ones you'll most likely want to tune first
+   for "feel" on the phone (see notes at the bottom of the file / chat).
+   ========================================================================= */
+const CONFIG = {
+  // ---- WORLD / ROUND -----------------------------------------------------
+  goalDistance:   60,     // ★ starting player→goal distance, in world units
+  goalRadius:     7,      // ★ reach within this of the goal = success
+  roundSeconds:   30,     //   target round length; drives the pressure ramp
+  failOnTimeout:  false,  //   if true, running out of time = fail
+
+  // ---- PLAYER MOVEMENT ---------------------------------------------------
+  maxSpeed:       22,     // ★ top speed (units/sec) at full finger distance
+  startHealth:    3,
+
+  // ---- GOAL MOVEMENT (optional) -----------------------------------------
+  goalMoves:      false,  // ★ does the goal slowly drift while you chase it?
+  goalMoveSpeed:  5,      //   units/sec when moving
+  goalTurnRate:   0.8,    //   how twitchy its wandering is (rad/sec-ish)
+
+  // ---- HAZARDS -----------------------------------------------------------
+  hazardCount:    3,      // ★ how many hazards (2–4 recommended)
+  hazardRadius:   7,      // ★ enter this radius = take damage
+  hazardWarnRange:16,     //   distance at which HUD says "hazard near"
+  hazardAudibleRange: 48, // ★ distance at which a hazard becomes audible
+  hazardPushback: 12,     //   how far you're shoved back on a hit (units)
+  damageCooldown: 0.9,    //   seconds of i-frames after a hit
+  hazardMinClearance: 14, //   keep hazards this far from start & goal at spawn
+
+  // ---- INPUT -------------------------------------------------------------
+  inputMode:      'touch',// 'touch' now; 'tilt' reserved (see Input module)
+  joystickRadiusPx: 130,  // ★ finger distance (px) that equals full speed
+  joystickDeadzonePx: 14, //   ignore tiny wobble near the touch-centre
+
+  // ---- AUDIO: GOAL TONE (pure sine = "the resonance") -------------------
+  goalWaveform:   'sine',
+  goalBaseFreq:   220,    // ★ Hz when far from the goal
+  goalNearFreq:   620,    // ★ Hz when right on top of the goal (pitch rises)
+  goalMinVol:     0.06,
+  goalMaxVol:     0.34,   // ★ how loud the goal gets up close
+  goalBehindDuck: 0.5,    //   volume multiplier when the goal is behind you
+
+  // ---- AUDIO: OFF-COURSE TEXTURE (a "wind" that fades in when misaligned)-
+  offCourseAngleDeg: 55,  // ★ heading error beyond which the wind fades in
+  offCourseMaxVol:   0.14,
+
+  // ---- AUDIO: HAZARDS (harsh & clearly different from the pure goal) -----
+  hazardWaveform: 'sawtooth', // deliberately gritty vs the goal's sine
+  hazardBaseFreq: 85,     // ★ low + menacing
+  hazardFreqSpread: 22,   //   each hazard is offset so they're distinguishable
+  hazardTremoloHz: 7,     // ★ amplitude pulsing that makes them feel "alive"
+  hazardMaxVol:   0.32,   // ★ loudness at point-blank range
+
+  // ---- AUDIO: PRESSURE / PURSUIT (optional rising drone) ----------------
+  pressureOn:     false,  // ★ toggle the "don't dawdle" pressure sound
+  pressureBaseFreq: 52,
+  pressureMaxVol: 0.16,   // ★ how loud it gets by end of round
+
+  // ---- AUDIO: GLOBAL -----------------------------------------------------
+  masterVolume:   0.9,
+  audioSmoothing: 0.03,   // seconds; time-constant for pan/vol glides (anti-click)
+
+  // ---- HAPTICS -----------------------------------------------------------
+  hapticsOn:      true,
+  hapticTickMs:   55,     // ★ scheduler tick; smaller = finer pulse control
+
+  // ---- DEBUG VISUALS -----------------------------------------------------
+  showDebug:      true,   // draw the dots + text (turn OFF to force eyes-closed)
+};
+
+/* Difficulty PRESETS: shallow-merged over CONFIG when a button is tapped.
+   Easy = 1–2 static hazards, close goal, no pressure.
+   Hard = more hazards, farther/moving goal, pressure on. */
+const PRESETS = {
+  easy:   { hazardCount: 1, goalDistance: 42, goalMoves: false, pressureOn: false,
+            maxSpeed: 20, hazardRadius: 8 },
+  normal: { hazardCount: 3, goalDistance: 60, goalMoves: false, pressureOn: false,
+            maxSpeed: 22, hazardRadius: 7 },
+  hard:   { hazardCount: 4, goalDistance: 78, goalMoves: true,  pressureOn: true,
+            maxSpeed: 26, hazardRadius: 6.5 },
+};
+
+
+/* =========================================================================
+   Small math helpers (shared)
+   ========================================================================= */
+const TAU = Math.PI * 2;
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const deg   = r => r * 180 / Math.PI;
+// Wrap an angle difference into [-PI, PI].
+function wrapAngle(a) { while (a >  Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; }
+
+
+/* =========================================================================
+   2) INPUT MODULE  — finger joystick -> desired movement vector.
+   -------------------------------------------------------------------------
+   Contract (this is ALL the game logic is allowed to know about input):
+
+       Input.read() -> { active, angle, magnitude }
+         active    : is the player currently commanding movement?
+         angle     : world heading in radians, y-UP (0 = +x/right, PI/2 = up)
+         magnitude : 0..1 speed request (0 = stop, 1 = full speed)
+
+   Because the game only reads that little struct, you can later drop in a
+   tilt/accelerometer implementation (deviceorientation) that fills the same
+   struct and NOTHING else changes.
+   ========================================================================= */
+const Input = {
+  _active: false,
+  _angle: Math.PI / 2,   // default heading = "up/forward" (matches goal-ahead)
+  _magnitude: 0,
+  _cx: 0, _cy: 0,        // touch origin (screen centre by default)
+  _pointerId: null,
+
+  init(canvas) {
+    // The joystick is centred on the SCREEN centre (not where you first touch),
+    // so "finger above centre = forward" is stable and eyes-closed friendly.
+    this._recenter();
+    window.addEventListener('resize', () => this._recenter());
+
+    // Pointer events cover both touch (phone) and mouse (desktop debugging).
+    canvas.addEventListener('pointerdown', e => this._down(e), { passive: false });
+    canvas.addEventListener('pointermove', e => this._move(e), { passive: false });
+    canvas.addEventListener('pointerup',   e => this._up(e),   { passive: false });
+    canvas.addEventListener('pointercancel', e => this._up(e), { passive: false });
+  },
+
+  _recenter() { this._cx = window.innerWidth / 2; this._cy = window.innerHeight / 2; },
+
+  _down(e) {
+    if (this._pointerId !== null) return;      // one finger drives the joystick
+    this._pointerId = e.pointerId;
+    this._update(e); e.preventDefault();
+  },
+  _move(e) { if (e.pointerId === this._pointerId) { this._update(e); e.preventDefault(); } },
+  _up(e)   {
+    if (e.pointerId !== this._pointerId) return;
+    this._pointerId = null; this._active = false; this._magnitude = 0; // release = stop
+    e.preventDefault();
+  },
+
+  _update(e) {
+    const dx = e.clientX - this._cx;           // screen-space offset from centre
+    const dy = e.clientY - this._cy;
+    const dist = Math.hypot(dx, dy);
+    if (dist < CONFIG.joystickDeadzonePx) { this._active = false; this._magnitude = 0; return; }
+    this._active = true;
+    // Convert to world coords: screen-y is DOWN, world-y is UP -> negate dy.
+    this._angle = Math.atan2(-dy, dx);
+    this._magnitude = clamp(dist / CONFIG.joystickRadiusPx, 0, 1);
+  },
+
+  read() { return { active: this._active, angle: this._angle, magnitude: this._magnitude }; },
+};
+
+
+/* =========================================================================
+   3) AUDIO MODULE  — Web Audio synthesis.
+   -------------------------------------------------------------------------
+   Sound GENERATION lives in create*Voice() functions; per-frame parameter
+   updates live in update*() functions. Everything you'd replace with real
+   sample playback later is isolated here. StereoPannerNode gives us explicit
+   -1..1 left/right control that maps directly to "direction relative to heading".
+   ========================================================================= */
+const Audio = {
+  ctx: null, master: null, ready: false,
+  goal: null, offcourse: null, pressure: null, hazards: [],
+  _noiseBuf: null,
+
+  // Called from the Start button (user gesture) — mobile autoplay policy.
+  init(hazardCount) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = CONFIG.masterVolume;
+    this.master.connect(this.ctx.destination);
+    this._noiseBuf = this._makeNoiseBuffer();
+
+    this.goal      = this._createGoalVoice();
+    this.offcourse = this._createOffCourseVoice();
+    this.pressure  = this._createPressureVoice();
+    this.hazards   = [];
+    for (let i = 0; i < hazardCount; i++) this.hazards.push(this._createHazardVoice(i));
+    this.ready = true;
+  },
+
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); },
+
+  // ---- Voice constructors (swap these bodies for sample players later) ----
+
+  _createGoalVoice() {
+    // Pure sine "resonance": osc -> gain(volume) -> stereo pan -> master.
+    const osc = this.ctx.createOscillator();
+    osc.type = CONFIG.goalWaveform; osc.frequency.value = CONFIG.goalBaseFreq;
+    const gain = this.ctx.createGain(); gain.gain.value = 0;
+    const pan  = this.ctx.createStereoPanner();
+    osc.connect(gain).connect(pan).connect(this.master);
+    osc.start();
+    return { osc, gain, pan };
+  },
+
+  _createOffCourseVoice() {
+    // Low-passed noise "wind" that fades in when badly misaligned.
+    const src = this.ctx.createBufferSource(); src.buffer = this._noiseBuf; src.loop = true;
+    const lp = this.ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+    const gain = this.ctx.createGain(); gain.gain.value = 0;
+    src.connect(lp).connect(gain).connect(this.master);
+    src.start();
+    return { src, gain };
+  },
+
+  _createHazardVoice(i) {
+    // Harsh saw + tremolo (LFO amplitude pulsing) so hazards feel dangerous
+    // and are unmistakably different from the pure goal sine.
+    const osc = this.ctx.createOscillator();
+    osc.type = CONFIG.hazardWaveform;
+    osc.frequency.value = CONFIG.hazardBaseFreq + i * CONFIG.hazardFreqSpread; // distinct pitch each
+    const amp  = this.ctx.createGain(); amp.gain.value = 0;   // proximity volume
+    const trem = this.ctx.createGain(); trem.gain.value = 0.6; // tremolo carrier
+    const pan  = this.ctx.createStereoPanner();
+    // LFO drives the tremolo depth.
+    const lfo = this.ctx.createOscillator();
+    lfo.frequency.value = CONFIG.hazardTremoloHz + i; // slightly different pulse per hazard
+    const lfoGain = this.ctx.createGain(); lfoGain.gain.value = 0.4;
+    lfo.connect(lfoGain).connect(trem.gain);
+    osc.connect(amp).connect(trem).connect(pan).connect(this.master);
+    osc.start(); lfo.start();
+    return { osc, amp, pan };
+  },
+
+  _createPressureVoice() {
+    // Slow rising pursuit drone: two detuned saws for an uneasy beat.
+    const oscA = this.ctx.createOscillator(); oscA.type = 'sawtooth'; oscA.frequency.value = CONFIG.pressureBaseFreq;
+    const oscB = this.ctx.createOscillator(); oscB.type = 'sawtooth'; oscB.frequency.value = CONFIG.pressureBaseFreq * 1.01;
+    const gain = this.ctx.createGain(); gain.gain.value = 0;
+    oscA.connect(gain); oscB.connect(gain); gain.connect(this.master);
+    oscA.start(); oscB.start();
+    return { gain };
+  },
+
+  // ---- Per-frame updates (called by Game.update) --------------------------
+
+  // closeness 0..1 (1 = at goal), pan -1..1, headingErr radians (0 = dead-on)
+  updateGoal(closeness, pan, headingErr) {
+    const tc = CONFIG.audioSmoothing, now = this.ctx.currentTime;
+    const freq = lerp(CONFIG.goalBaseFreq, CONFIG.goalNearFreq, closeness);
+    let vol = lerp(CONFIG.goalMinVol, CONFIG.goalMaxVol, closeness);
+    // Duck the goal when it's behind you so "ahead" reads as clearer/brighter.
+    if (Math.abs(headingErr) > Math.PI / 2) vol *= CONFIG.goalBehindDuck;
+    this.goal.osc.frequency.setTargetAtTime(freq, now, tc);
+    this.goal.gain.gain.setTargetAtTime(vol, now, tc);
+    this.goal.pan.pan.setTargetAtTime(pan, now, tc);
+
+    // Off-course wind fades in past the threshold angle.
+    const thresh = CONFIG.offCourseAngleDeg * Math.PI / 180;
+    const t = clamp((Math.abs(headingErr) - thresh) / (Math.PI - thresh), 0, 1);
+    this.offcourse.gain.gain.setTargetAtTime(t * CONFIG.offCourseMaxVol, now, tc);
+  },
+
+  updateHazard(i, proximity, pan) {           // proximity 0..1 (1 = point-blank)
+    const h = this.hazards[i]; if (!h) return;
+    const tc = CONFIG.audioSmoothing, now = this.ctx.currentTime;
+    h.amp.gain.setTargetAtTime(proximity * proximity * CONFIG.hazardMaxVol, now, tc); // squared = stays quiet until close
+    h.pan.pan.setTargetAtTime(pan, now, tc);
+  },
+
+  updatePressure(t01) {                        // t01 0..1 across the round
+    if (!this.pressure) return;
+    const vol = CONFIG.pressureOn ? t01 * CONFIG.pressureMaxVol : 0;
+    this.pressure.gain.gain.setTargetAtTime(vol, this.ctx.currentTime, 0.2);
+  },
+
+  // ---- One-shot event sounds ---------------------------------------------
+
+  playDamage() {
+    // Gritty noise burst + a downward low thump.
+    const now = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource(); src.buffer = this._noiseBuf;
+    const bp = this.ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 320; bp.Q.value = 0.7;
+    const g = this.ctx.createGain(); g.gain.setValueAtTime(0.5, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+    src.connect(bp).connect(g).connect(this.master); src.start(now); src.stop(now + 0.36);
+    this._blip(140, 60, 0.4, 0.3, 'square', now);
+  },
+
+  playGoalReached() {
+    // Bright ascending arpeggio — unmistakably "you won".
+    const now = this.ctx.currentTime;
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) =>
+      this._blip(f, f, 0.28, 0.22, 'sine', now + i * 0.11));
+  },
+
+  // Tiny envelope tone helper (glide fromF->toF over dur seconds).
+  _blip(fromF, toF, dur, vol, wave, when) {
+    const o = this.ctx.createOscillator(); o.type = wave;
+    o.frequency.setValueAtTime(fromF, when); o.frequency.exponentialRampToValueAtTime(Math.max(1, toF), when + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(vol, when + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    o.connect(g).connect(this.master); o.start(when); o.stop(when + dur + 0.02);
+  },
+
+  // Silence all continuous voices (used on win/lose).
+  silence() {
+    if (!this.ready) return;
+    const now = this.ctx.currentTime, tc = 0.05;
+    this.goal.gain.gain.setTargetAtTime(0, now, tc);
+    this.offcourse.gain.gain.setTargetAtTime(0, now, tc);
+    this.pressure.gain.gain.setTargetAtTime(0, now, tc);
+    this.hazards.forEach(h => h.amp.gain.setTargetAtTime(0, now, tc));
+  },
+
+  _makeNoiseBuffer() {
+    const len = this.ctx.sampleRate * 1.0;
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  },
+};
+
+
+/* =========================================================================
+   4) HAPTICS MODULE  — navigator.vibrate scheduler.
+   -------------------------------------------------------------------------
+   Web vibration is essentially ON/OFF, so we FAKE intensity with pulse
+   FREQUENCY + width: a scheduler tick decides, each tick, whether to fire a
+   short pulse and how long. Nearer hazard => denser/longer pulses.
+
+   Contract for the game logic:
+       Haptics.setState({ onCourse, hazardProx, moving })  // continuous feel
+       Haptics.event('damage' | 'goal')                    // one-shots
+
+   Later you'll replace the guts with your Unity variable-amplitude script;
+   the setState/event contract stays the same.
+   ========================================================================= */
+const Haptics = {
+  supported: 'vibrate' in navigator,
+  enabled: CONFIG.hapticsOn,
+  _timer: null, _tick: 0,
+  _state: { onCourse: false, hazardProx: 0, moving: false },
+  _oneShot: null,
+
+  start() {
+    if (!this.supported || !this.enabled) return;
+    this.stop();
+    this._timer = setInterval(() => this._run(), CONFIG.hapticTickMs);
+  },
+  stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } this._buzz(0); },
+
+  setState(s) { this._state = s; },
+
+  // Distinct one-shot patterns. These bypass the ambient scheduler for a beat.
+  event(kind) {
+    if (!this.supported || !this.enabled) return;
+    if (kind === 'damage') this._oneShot = { pattern: [0, 90, 40, 90, 40, 160], hold: 8 }; // sharp triple stab
+    else if (kind === 'goal') this._oneShot = { pattern: [0, 60, 50, 60, 50, 60, 50, 260], hold: 12 }; // happy flourish
+    if (this._oneShot) { this._buzz(this._oneShot.pattern); }
+  },
+
+  _run() {
+    this._tick++;
+    // Let a one-shot pattern play out uninterrupted.
+    if (this._oneShot) { if (--this._oneShot.hold <= 0) this._oneShot = null; return; }
+
+    const s = this._state;
+    if (s.hazardProx > 0.15) {
+      // Near a hazard: SHARP buzz, denser as you close in.
+      // proximity 0.15..1 -> fire every 2..1 ticks, pulse width 25..70ms.
+      const every = s.hazardProx > 0.6 ? 1 : 2;
+      if (this._tick % every === 0) this._buzz([0, Math.round(lerp(25, 70, s.hazardProx))]);
+    } else if (s.onCourse && s.moving) {
+      // On course & moving: SOFT, sparse reassurance pulse (~ every 4 ticks).
+      if (this._tick % 4 === 0) this._buzz([0, 18]);
+    }
+    // else: silence (drifting badly, or stopped) — the audio carries it.
+  },
+
+  _buzz(p) { if (this.supported && this.enabled) { try { navigator.vibrate(p); } catch (e) {} } },
+};
+
+
+/* =========================================================================
+   5) GAME MODULE  — state, rules, main loop, debug rendering.
+   ========================================================================= */
+const Game = {
+  cv: null, ctx2d: null,
+  running: false, lastT: 0,
+  player: { x: 0, y: 0 },
+  goal: { x: 0, y: 0, dir: 0 },
+  hazards: [],
+  heading: Math.PI / 2,   // persists between finger-lifts
+  health: 0,
+  elapsed: 0,
+  invuln: 0,
+  startDist: 1,
+  viewHalf: 60,           // world half-extent used for fit-to-screen drawing
+  lastHitHazard: -1,
+
+  init() {
+    this.cv = document.getElementById('cv');
+    this.ctx2d = this.cv.getContext('2d');
+    this._resize(); window.addEventListener('resize', () => this._resize());
+    Input.init(this.cv);
+  },
+
+  _dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); },
+
+  _resize() {
+    const dpr = window.devicePixelRatio || 1;
+    this.cv.width = window.innerWidth * dpr;
+    this.cv.height = window.innerHeight * dpr;
+    this.ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+  },
+
+  // Build a fresh round from CONFIG. Called on Start / Retry.
+  reset() {
+    const gd = CONFIG.goalDistance;
+    // Player at bottom-centre, goal straight "up" (so start heading = on-course).
+    this.player = { x: 0, y: -gd / 2 };
+    this.goal   = { x: 0, y:  gd / 2, dir: Math.random() * TAU };
+    this.heading = Math.PI / 2;
+    this.health = CONFIG.startHealth;
+    this.elapsed = 0; this.invuln = 0; this.lastHitHazard = -1;
+    this.startDist = this._dist(this.player, this.goal);
+    this.viewHalf = gd / 2 + 26;    // leave margin around the two endpoints
+    this._spawnHazards();
+  },
+
+  _spawnHazards() {
+    this.hazards = [];
+    const half = this.viewHalf, minC = CONFIG.hazardMinClearance;
+    let guard = 0;
+    while (this.hazards.length < CONFIG.hazardCount && guard++ < 500) {
+      const h = { x: (Math.random() * 2 - 1) * half * 0.75,
+                  y: (Math.random() * 2 - 1) * (this.goal.y - CONFIG.hazardMinClearance) };
+      if (this._dist(h, this.player) < minC + CONFIG.hazardRadius) continue;
+      if (this._dist(h, this.goal)   < minC + CONFIG.goalRadius)   continue;
+      if (this.hazards.some(o => this._dist(o, h) < minC)) continue;
+      this.hazards.push(h);
+    }
+  },
+
+  begin(diff) {
+    // Apply chosen difficulty preset over CONFIG, then build round + audio.
+    if (diff && PRESETS[diff]) Object.assign(CONFIG, PRESETS[diff]);
+    this.reset();
+    Audio.init(CONFIG.hazardCount);
+    Audio.resume();
+    Haptics.enabled = CONFIG.hapticsOn;
+    Haptics.start();
+    this.running = true; this.lastT = performance.now();
+    requestAnimationFrame(t => this._frame(t));
+  },
+
+  _frame(t) {
+    if (!this.running) return;
+    const dt = Math.min(0.05, (t - this.lastT) / 1000); // clamp big gaps (tab switches)
+    this.lastT = t;
+    this.update(dt);
+    requestAnimationFrame(x => this._frame(x));
+  },
+
+  update(dt) {
+    this.elapsed += dt;
+    if (this.invuln > 0) this.invuln -= dt;
+
+    // --- INPUT -> movement ------------------------------------------------
+    const inp = Input.read();
+    let moving = false;
+    if (inp.active && inp.magnitude > 0) {
+      this.heading = inp.angle;                       // heading only updates while steering
+      const speed = inp.magnitude * CONFIG.maxSpeed;
+      this.player.x += Math.cos(this.heading) * speed * dt;
+      this.player.y += Math.sin(this.heading) * speed * dt;
+      moving = true;
+    }
+    // Keep player inside the playfield.
+    this.player.x = clamp(this.player.x, -this.viewHalf, this.viewHalf);
+    this.player.y = clamp(this.player.y, -this.viewHalf, this.viewHalf);
+
+    // --- Optional moving goal --------------------------------------------
+    if (CONFIG.goalMoves) {
+      this.goal.dir += (Math.random() * 2 - 1) * CONFIG.goalTurnRate * dt;
+      this.goal.x += Math.cos(this.goal.dir) * CONFIG.goalMoveSpeed * dt;
+      this.goal.y += Math.sin(this.goal.dir) * CONFIG.goalMoveSpeed * dt;
+      // Bounce softly off the bounds so it doesn't escape.
+      const m = this.viewHalf - 6;
+      if (Math.abs(this.goal.x) > m) { this.goal.x = clamp(this.goal.x, -m, m); this.goal.dir = Math.PI - this.goal.dir; }
+      if (Math.abs(this.goal.y) > m) { this.goal.y = clamp(this.goal.y, -m, m); this.goal.dir = -this.goal.dir; }
+    }
+
+    // --- Geometry: direction/closeness to goal relative to HEADING --------
+    const gdx = this.goal.x - this.player.x, gdy = this.goal.y - this.player.y;
+    const goalDist = Math.hypot(gdx, gdy);
+    const goalAngle = Math.atan2(gdy, gdx);
+    const headingErr = wrapAngle(goalAngle - this.heading); // + = goal to your LEFT
+    // Pan: goal-left => pan left (-1). StereoPanner: -1 left, +1 right.
+    const goalPan = clamp(-Math.sin(headingErr), -1, 1);
+    const closeness = clamp(1 - goalDist / this.startDist, 0, 1);
+
+    // --- WIN check --------------------------------------------------------
+    if (goalDist <= CONFIG.goalRadius) { this._end(true); return; }
+
+    // --- Hazards: audio + damage -----------------------------------------
+    let nearestHazProx = 0;
+    for (let i = 0; i < this.hazards.length; i++) {
+      const h = this.hazards[i];
+      const hdx = h.x - this.player.x, hdy = h.y - this.player.y;
+      const hd = Math.hypot(hdx, hdy);
+      const hAngle = Math.atan2(hdy, hdx);
+      const hErr = wrapAngle(hAngle - this.heading);
+      const hPan = clamp(-Math.sin(hErr), -1, 1);
+      const proximity = clamp(1 - hd / CONFIG.hazardAudibleRange, 0, 1);
+      Audio.updateHazard(i, proximity, hPan);
+      if (proximity > nearestHazProx) nearestHazProx = proximity;
+
+      // Damage on entering the radius (respecting i-frames).
+      if (hd <= CONFIG.hazardRadius && this.invuln <= 0) {
+        this.health -= 1; this.invuln = CONFIG.damageCooldown; this.lastHitHazard = i;
+        // Push the player back away from the hazard centre.
+        const away = Math.atan2(-hdy, -hdx);
+        this.player.x += Math.cos(away) * CONFIG.hazardPushback;
+        this.player.y += Math.sin(away) * CONFIG.hazardPushback;
+        Audio.playDamage(); Haptics.event('damage');
+        if (this.health <= 0) { this._end(false); return; }
+      }
+    }
+
+    // --- Drive audio + haptics -------------------------------------------
+    Audio.updateGoal(closeness, goalPan, headingErr);
+    Audio.updatePressure(clamp(this.elapsed / CONFIG.roundSeconds, 0, 1));
+
+    const onCourse = Math.abs(headingErr) < (12 * Math.PI / 180);
+    Haptics.setState({ onCourse, hazardProx: nearestHazProx, moving });
+
+    // --- Optional timeout fail -------------------------------------------
+    if (CONFIG.failOnTimeout && this.elapsed > CONFIG.roundSeconds) { this._end(false); return; }
+
+    // --- Debug render -----------------------------------------------------
+    if (CONFIG.showDebug) this._draw(headingErr, goalDist, nearestHazProx);
+    this._hud(headingErr, goalDist, nearestHazProx);
+  },
+
+  _end(win) {
+    this.running = false;
+    Audio.silence(); Haptics.stop();
+    if (win) { Audio.playGoalReached(); Haptics.event('goal'); }
+    else     { Audio.playDamage(); }
+    const ov = document.getElementById('endOverlay');
+    document.getElementById('endTitle').textContent = win ? '✨ Goal reached' : '💀 Failed';
+    document.getElementById('endMsg').textContent = win
+      ? `You found the resonance in ${this.elapsed.toFixed(1)}s.`
+      : (this.health <= 0 ? 'The hazards claimed you.' : 'Time ran out.');
+    ov.classList.remove('hidden');
+  },
+
+  // ---- DEBUG RENDER (sighted-dev only) ----------------------------------
+  _w2s(p) { // world (y-up, centred) -> screen pixels, fit to shorter axis
+    const W = window.innerWidth, H = window.innerHeight;
+    const scale = Math.min(W, H) / (this.viewHalf * 2.2);
+    return { x: W / 2 + p.x * scale, y: H / 2 - p.y * scale, s: scale };
+  },
+  _draw(headingErr, goalDist, hazProx) {
+    const g = this.ctx2d, W = window.innerWidth, H = window.innerHeight;
+    g.clearRect(0, 0, W, H);
+
+    // hazards (red) with damage + audible rings
+    for (const h of this.hazards) {
+      const p = this._w2s(h);
+      g.strokeStyle = 'rgba(255,80,80,.12)'; g.beginPath();
+      g.arc(p.x, p.y, CONFIG.hazardAudibleRange * p.s, 0, TAU); g.stroke();
+      g.strokeStyle = 'rgba(255,80,80,.5)'; g.beginPath();
+      g.arc(p.x, p.y, CONFIG.hazardRadius * p.s, 0, TAU); g.stroke();
+      g.fillStyle = '#ff5050'; g.beginPath(); g.arc(p.x, p.y, 7, 0, TAU); g.fill();
+    }
+    // goal (green) + radius
+    const gp = this._w2s(this.goal);
+    g.strokeStyle = 'rgba(106,209,154,.6)'; g.beginPath();
+    g.arc(gp.x, gp.y, CONFIG.goalRadius * gp.s, 0, TAU); g.stroke();
+    g.fillStyle = '#6ad19a'; g.beginPath(); g.arc(gp.x, gp.y, 9, 0, TAU); g.fill();
+    // player (blue) + heading whisker
+    const pp = this._w2s(this.player);
+    g.fillStyle = this.invuln > 0 ? '#ffd36a' : '#6ab0ff';
+    g.beginPath(); g.arc(pp.x, pp.y, 9, 0, TAU); g.fill();
+    g.strokeStyle = '#6ab0ff'; g.lineWidth = 3; g.beginPath();
+    g.moveTo(pp.x, pp.y);
+    g.lineTo(pp.x + Math.cos(this.heading) * 26, pp.y - Math.sin(this.heading) * 26);
+    g.stroke(); g.lineWidth = 1;
+  },
+
+  _hud(headingErr, goalDist, hazProx) {
+    const stateEl = document.getElementById('state');
+    let txt, err = deg(headingErr);
+    if (this.invuln > CONFIG.damageCooldown - 0.25) txt = '💥 DAMAGE!';
+    else if (hazProx > 0.62) txt = '⚠️ hazard near';
+    else if (Math.abs(err) < 12) txt = '✅ on course';
+    else txt = `↪ drifting — goal to your ${err > 0 ? 'LEFT' : 'RIGHT'} (${Math.abs(err).toFixed(0)}°)`;
+    stateEl.textContent = txt;
+
+    document.getElementById('health').textContent =
+      '♥ '.repeat(Math.max(0, this.health)).trim() || '—';
+    document.getElementById('meta').textContent =
+      `dist ${goalDist.toFixed(0)} · t ${this.elapsed.toFixed(1)}s` +
+      `${CONFIG.pressureOn ? ' · pressure' : ''}${CONFIG.goalMoves ? ' · moving goal' : ''}`;
+  },
+};
+
+
+/* =========================================================================
+   6) BOOT / UI WIRING
+   ========================================================================= */
+(function boot() {
+  Game.init();
+
+  let chosenDiff = 'normal';
+  const diffBtns = document.querySelectorAll('.diff');
+  function selectDiff(d) {
+    chosenDiff = d;
+    diffBtns.forEach(b => b.classList.toggle('active', b.dataset.diff === d));
+  }
+  diffBtns.forEach(b => b.addEventListener('click', () => selectDiff(b.dataset.diff)));
+  selectDiff('normal');
+
+  document.getElementById('startBtn').addEventListener('click', () => {
+    document.getElementById('startOverlay').classList.add('hidden');
+    Game.begin(chosenDiff);
+  });
+
+  document.getElementById('retryBtn').addEventListener('click', () => {
+    document.getElementById('endOverlay').classList.add('hidden');
+    // Re-init audio graph fresh (context is fine to reuse) and restart round.
+    Game.reset();
+    Audio.resume();
+    Haptics.start();
+    Game.running = true; Game.lastT = performance.now();
+    requestAnimationFrame(t => Game._frame(t));
+  });
+})();
+</script>
+</body>
+</html>
