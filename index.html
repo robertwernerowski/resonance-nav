@@ -120,14 +120,19 @@ const CONFIG = {
   goalMoveSpeed:  5,      //   units/sec when moving
   goalTurnRate:   0.8,    //   how twitchy its wandering is (rad/sec-ish)
 
-  // ---- HAZARDS -----------------------------------------------------------
-  hazardCount:    3,      // ★ how many hazards (2–4 recommended)
-  hazardRadius:   7,      // ★ enter this radius = take damage
-  hazardWarnRange:16,     //   distance at which HUD says "hazard near"
-  hazardAudibleRange: 48, // ★ distance at which a hazard becomes audible
+  // ---- HAZARDS (the forest MONSTERS) ------------------------------------
+  hazardCount:    3,      // ★ how many monsters (2–4 recommended)
+  hazardRadius:   7,      // ★ enter this radius = the monster mauls you
+  hazardWarnRange:16,     //   distance at which HUD says "monster near"
+  hazardAudibleRange: 48, // ★ distance at which a monster becomes audible
   hazardPushback: 12,     //   how far you're shoved back on a hit (units)
   damageCooldown: 0.9,    //   seconds of i-frames after a hit
-  hazardMinClearance: 14, //   keep hazards this far from start & goal at spawn
+  hazardMinClearance: 14, //   keep monsters this far from start & goal at spawn
+  // Monster movement (used on Hard): they prowl toward you when you're close.
+  hazardMove:     false,  // ★ do monsters hunt the player?
+  hazardChaseSpeed: 9,    // ★ monster chase speed (units/sec) — keep < maxSpeed
+  hazardSenseRange: 40,   //   monsters only wake & chase within this distance
+  hazardWander:   3,      //   idle drift speed when they haven't sensed you yet
 
   // ---- INPUT -------------------------------------------------------------
   inputMode:      'touch',// 'touch' now; 'tilt' reserved (see Input module)
@@ -179,7 +184,7 @@ const PRESETS = {
   normal: { hazardCount: 3, goalDistance: 60, goalMoves: false, pressureOn: false,
             maxSpeed: 22, hazardRadius: 7 },
   hard:   { hazardCount: 4, goalDistance: 78, goalMoves: true,  pressureOn: true,
-            maxSpeed: 26, hazardRadius: 6.5 },
+            maxSpeed: 26, hazardRadius: 6.5, hazardMove: true },
 };
 
 
@@ -268,7 +273,7 @@ const Input = {
 const Audio = {
   ctx: null, master: null, ready: false,
   goal: null, offcourse: null, pressure: null, hazards: [],
-  _noiseBuf: null,
+  _noiseBuf: null, _echo: null,
 
   // Called from the Start button (user gesture) — mobile autoplay policy.
   init(hazardCount) {
@@ -278,6 +283,7 @@ const Audio = {
     this.master.gain.value = CONFIG.masterVolume;
     this.master.connect(this.ctx.destination);
     this._noiseBuf = this._makeNoiseBuffer();
+    this._echo = this._createEcho();      // shared echo/space for the magic chime
 
     this.goal      = this._createGoalVoice();
     this.offcourse = this._createOffCourseVoice();
@@ -291,15 +297,38 @@ const Audio = {
 
   // ---- Voice constructors (swap these bodies for sample players later) ----
 
+  // A short feedback delay with a little high-pass — gives one-shot magic
+  // sounds a sense of enchanted space without a heavy convolution reverb.
+  _createEcho() {
+    const input = this.ctx.createGain();
+    const delay = this.ctx.createDelay(1.0); delay.delayTime.value = 0.24;
+    const fb    = this.ctx.createGain();     fb.gain.value = 0.4;   // echo tail length
+    const tone  = this.ctx.createBiquadFilter(); tone.type = 'highpass'; tone.frequency.value = 500;
+    const wet   = this.ctx.createGain();     wet.gain.value = 0.85;
+    input.connect(delay); delay.connect(tone); tone.connect(fb); fb.connect(delay);
+    tone.connect(wet).connect(this.master);
+    return { input };
+  },
+
   _createGoalVoice() {
-    // Pure sine "resonance": osc -> gain(volume) -> stereo pan -> master.
+    // Magical "resonance": a pure sine fundamental PLUS a quiet shimmering
+    // octave partial (twinkled by a slow LFO) so the goal feels enchanted,
+    // not just a test tone. osc/osc2 -> gain(volume) -> stereo pan -> master.
     const osc = this.ctx.createOscillator();
     osc.type = CONFIG.goalWaveform; osc.frequency.value = CONFIG.goalBaseFreq;
+    const osc2 = this.ctx.createOscillator();          // shimmer, one octave up
+    osc2.type = 'triangle'; osc2.frequency.value = CONFIG.goalBaseFreq * 2; osc2.detune.value = 6;
+    const shimmer = this.ctx.createGain(); shimmer.gain.value = 0.22;
+    const twinkle = this.ctx.createOscillator(); twinkle.type = 'sine'; twinkle.frequency.value = 5.5;
+    const twinkleDepth = this.ctx.createGain(); twinkleDepth.gain.value = 0.12;
+    twinkle.connect(twinkleDepth).connect(shimmer.gain);
     const gain = this.ctx.createGain(); gain.gain.value = 0;
     const pan  = this.ctx.createStereoPanner();
-    osc.connect(gain).connect(pan).connect(this.master);
-    osc.start();
-    return { osc, gain, pan };
+    osc.connect(gain);
+    osc2.connect(shimmer).connect(gain);
+    gain.connect(pan).connect(this.master);
+    osc.start(); osc2.start(); twinkle.start();
+    return { osc, osc2, gain, pan };
   },
 
   _createOffCourseVoice() {
@@ -313,22 +342,43 @@ const Audio = {
   },
 
   _createHazardVoice(i) {
-    // Harsh saw + tremolo (LFO amplitude pulsing) so hazards feel dangerous
-    // and are unmistakably different from the pure goal sine.
+    // A forest MONSTER growling in the undergrowth. Two layers:
+    //   1) a low saw pushed through a resonant low-pass = a muffled animal
+    //      roar, pitch-warbled by a slow LFO so it "snarls", and amplitude-
+    //      pulsed by a tremolo so it "breathes".
+    //   2) a band-passed noise layer = rustling/hissing in the leaves, which
+    //      you can hear from a little further out ("something's out there").
+    // Each monster has a distinct pitch + warble rate so they're separable.
+    const baseF = CONFIG.hazardBaseFreq + i * CONFIG.hazardFreqSpread;
+
+    // --- Layer 1: the growl -------------------------------------------------
     const osc = this.ctx.createOscillator();
-    osc.type = CONFIG.hazardWaveform;
-    osc.frequency.value = CONFIG.hazardBaseFreq + i * CONFIG.hazardFreqSpread; // distinct pitch each
-    const amp  = this.ctx.createGain(); amp.gain.value = 0;   // proximity volume
-    const trem = this.ctx.createGain(); trem.gain.value = 0.6; // tremolo carrier
-    const pan  = this.ctx.createStereoPanner();
-    // LFO drives the tremolo depth.
-    const lfo = this.ctx.createOscillator();
-    lfo.frequency.value = CONFIG.hazardTremoloHz + i; // slightly different pulse per hazard
-    const lfoGain = this.ctx.createGain(); lfoGain.gain.value = 0.4;
-    lfo.connect(lfoGain).connect(trem.gain);
-    osc.connect(amp).connect(trem).connect(pan).connect(this.master);
-    osc.start(); lfo.start();
-    return { osc, amp, pan };
+    osc.type = CONFIG.hazardWaveform; osc.frequency.value = baseF;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = baseF * 6 + 180; lp.Q.value = 7; // vocal-ish "throat"
+    // Snarl: slow LFO wobbles the pitch up and down like a growl.
+    const growlLfo = this.ctx.createOscillator(); growlLfo.type = 'sine';
+    growlLfo.frequency.value = 3.5 + i * 0.8;
+    const growlDepth = this.ctx.createGain(); growlDepth.gain.value = baseF * 0.28;
+    growlLfo.connect(growlDepth).connect(osc.frequency);
+    // Breathing: tremolo on amplitude.
+    const trem = this.ctx.createGain(); trem.gain.value = 0.55;
+    const tlfo = this.ctx.createOscillator(); tlfo.frequency.value = CONFIG.hazardTremoloHz + i;
+    const tdepth = this.ctx.createGain(); tdepth.gain.value = 0.45;
+    tlfo.connect(tdepth).connect(trem.gain);
+    const amp = this.ctx.createGain(); amp.gain.value = 0;   // proximity volume (growl)
+    const pan = this.ctx.createStereoPanner();
+    osc.connect(lp).connect(trem).connect(amp).connect(pan).connect(this.master);
+
+    // --- Layer 2: the rustle ------------------------------------------------
+    const noise = this.ctx.createBufferSource(); noise.buffer = this._noiseBuf; noise.loop = true;
+    const nbp = this.ctx.createBiquadFilter();
+    nbp.type = 'bandpass'; nbp.frequency.value = 1100 + i * 350; nbp.Q.value = 0.7;
+    const noiseAmp = this.ctx.createGain(); noiseAmp.gain.value = 0;
+    noise.connect(nbp).connect(noiseAmp).connect(pan);   // shares the monster's pan
+
+    osc.start(); growlLfo.start(); tlfo.start(); noise.start();
+    return { osc, amp, noiseAmp, pan };
   },
 
   _createPressureVoice() {
@@ -351,6 +401,7 @@ const Audio = {
     // Duck the goal when it's behind you so "ahead" reads as clearer/brighter.
     if (Math.abs(headingErr) > Math.PI / 2) vol *= CONFIG.goalBehindDuck;
     this.goal.osc.frequency.setTargetAtTime(freq, now, tc);
+    this.goal.osc2.frequency.setTargetAtTime(freq * 2, now, tc);   // shimmer tracks an octave up
     this.goal.gain.gain.setTargetAtTime(vol, now, tc);
     this.goal.pan.pan.setTargetAtTime(pan, now, tc);
 
@@ -363,7 +414,10 @@ const Audio = {
   updateHazard(i, proximity, pan) {           // proximity 0..1 (1 = point-blank)
     const h = this.hazards[i]; if (!h) return;
     const tc = CONFIG.audioSmoothing, now = this.ctx.currentTime;
-    h.amp.gain.setTargetAtTime(proximity * proximity * CONFIG.hazardMaxVol, now, tc); // squared = stays quiet until close
+    // Growl stays quiet until you're close (squared); the leafy rustle is
+    // audible from further out (linear) so distant monsters just "whisper".
+    h.amp.gain.setTargetAtTime(proximity * proximity * CONFIG.hazardMaxVol, now, tc);
+    h.noiseAmp.gain.setTargetAtTime(proximity * 0.11, now, tc);
     h.pan.pan.setTargetAtTime(pan, now, tc);
   },
 
@@ -386,10 +440,32 @@ const Audio = {
   },
 
   playGoalReached() {
-    // Bright ascending arpeggio — unmistakably "you won".
+    // "Fantasy magic" flourish: a shimmering ascending pentatonic run fed
+    // through the echo bus (enchanted space), a scatter of high sparkle
+    // notes, and a warm low bloom swelling underneath.
     const now = this.ctx.currentTime;
-    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) =>
-      this._blip(f, f, 0.28, 0.22, 'sine', now + i * 0.11));
+    const run = [523.25, 587.33, 698.46, 783.99, 1046.50, 1174.66]; // C D F G C D
+    run.forEach((f, i) => this._magicNote(f, now + i * 0.09, 0.9, 0.20, 'sine'));
+    // Sparkle cluster — twinkling high harmonics, randomly scattered in time.
+    for (let k = 0; k < 9; k++) {
+      const f = 1568 * Math.pow(2, Math.random() * 0.4);            // ~G6 and up
+      this._magicNote(f, now + 0.18 + Math.random() * 0.8, 0.55, 0.055, 'triangle');
+    }
+    // Low harmonic bloom for warmth/weight.
+    this._blip(130.81, 261.63, 1.3, 0.13, 'sine', now);
+  },
+
+  // Like _blip, but sustained + routed through the echo bus for the magic feel.
+  _magicNote(freq, when, dur, vol, wave) {
+    const o = this.ctx.createOscillator(); o.type = wave || 'sine'; o.frequency.value = freq;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(vol, when + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    o.connect(g);
+    g.connect(this.master);          // dry
+    if (this._echo) g.connect(this._echo.input); // + echo tail
+    o.start(when); o.stop(when + dur + 0.05);
   },
 
   // Tiny envelope tone helper (glide fromF->toF over dur seconds).
@@ -410,7 +486,10 @@ const Audio = {
     this.goal.gain.gain.setTargetAtTime(0, now, tc);
     this.offcourse.gain.gain.setTargetAtTime(0, now, tc);
     this.pressure.gain.gain.setTargetAtTime(0, now, tc);
-    this.hazards.forEach(h => h.amp.gain.setTargetAtTime(0, now, tc));
+    this.hazards.forEach(h => {
+      h.amp.gain.setTargetAtTime(0, now, tc);
+      h.noiseAmp.gain.setTargetAtTime(0, now, tc);
+    });
   },
 
   _makeNoiseBuffer() {
@@ -492,6 +571,7 @@ const Game = {
   player: { x: 0, y: 0 },
   goal: { x: 0, y: 0, dir: 0 },
   hazards: [],
+  trees: [],              // decorative forest for the debug map
   heading: Math.PI / 2,   // persists between finger-lifts
   health: 0,
   elapsed: 0,
@@ -528,6 +608,7 @@ const Game = {
     this.startDist = this._dist(this.player, this.goal);
     this.viewHalf = gd / 2 + 26;    // leave margin around the two endpoints
     this._spawnHazards();
+    this._makeTrees();
   },
 
   _spawnHazards() {
@@ -536,12 +617,29 @@ const Game = {
     let guard = 0;
     while (this.hazards.length < CONFIG.hazardCount && guard++ < 500) {
       const h = { x: (Math.random() * 2 - 1) * half * 0.75,
-                  y: (Math.random() * 2 - 1) * (this.goal.y - CONFIG.hazardMinClearance) };
+                  y: (Math.random() * 2 - 1) * (this.goal.y - CONFIG.hazardMinClearance),
+                  dir: Math.random() * TAU };  // facing for idle prowl
       if (this._dist(h, this.player) < minC + CONFIG.hazardRadius) continue;
       if (this._dist(h, this.goal)   < minC + CONFIG.goalRadius)   continue;
       if (this.hazards.some(o => this._dist(o, h) < minC)) continue;
       this.hazards.push(h);
     }
+  },
+
+  // Scatter decorative trees across the map (visual only — no collision).
+  _makeTrees() {
+    this.trees = [];
+    const half = this.viewHalf, n = 48;
+    for (let i = 0; i < n; i++) {
+      this.trees.push({
+        x: (Math.random() * 2 - 1) * half,
+        y: (Math.random() * 2 - 1) * half,
+        s: 0.7 + Math.random() * 1.0,        // size variation
+        tint: Math.random(),                 // slight colour variation
+      });
+    }
+    // Draw back-to-front so nearer (lower on screen) trees overlap correctly.
+    this.trees.sort((a, b) => b.y - a.y);
   },
 
   begin(diff) {
@@ -591,6 +689,27 @@ const Game = {
       const m = this.viewHalf - 6;
       if (Math.abs(this.goal.x) > m) { this.goal.x = clamp(this.goal.x, -m, m); this.goal.dir = Math.PI - this.goal.dir; }
       if (Math.abs(this.goal.y) > m) { this.goal.y = clamp(this.goal.y, -m, m); this.goal.dir = -this.goal.dir; }
+    }
+
+    // --- Monster movement (Hard): prowl, then HUNT when they sense you -----
+    if (CONFIG.hazardMove) {
+      const bound = this.viewHalf - 4;
+      for (const h of this.hazards) {
+        const dx = this.player.x - h.x, dy = this.player.y - h.y;
+        const d = Math.hypot(dx, dy) || 1;
+        if (d < CONFIG.hazardSenseRange) {
+          // Sensed you — charge straight at the player.
+          h.x += (dx / d) * CONFIG.hazardChaseSpeed * dt;
+          h.y += (dy / d) * CONFIG.hazardChaseSpeed * dt;
+          h.dir = Math.atan2(dy, dx);
+        } else {
+          // Hasn't noticed you yet — slow, aimless prowl.
+          h.dir += (Math.random() * 2 - 1) * 1.5 * dt;
+          h.x += Math.cos(h.dir) * CONFIG.hazardWander * dt;
+          h.y += Math.sin(h.dir) * CONFIG.hazardWander * dt;
+        }
+        h.x = clamp(h.x, -bound, bound); h.y = clamp(h.y, -bound, bound);
+      }
     }
 
     // --- Geometry: direction/closeness to goal relative to HEADING --------
@@ -653,8 +772,8 @@ const Game = {
     const ov = document.getElementById('endOverlay');
     document.getElementById('endTitle').textContent = win ? '✨ Goal reached' : '💀 Failed';
     document.getElementById('endMsg').textContent = win
-      ? `You found the resonance in ${this.elapsed.toFixed(1)}s.`
-      : (this.health <= 0 ? 'The hazards claimed you.' : 'Time ran out.');
+      ? `You reached the resonance in ${this.elapsed.toFixed(1)}s.`
+      : (this.health <= 0 ? 'The forest monsters claimed you.' : 'Time ran out.');
     ov.classList.remove('hidden');
   },
 
@@ -664,39 +783,104 @@ const Game = {
     const scale = Math.min(W, H) / (this.viewHalf * 2.2);
     return { x: W / 2 + p.x * scale, y: H / 2 - p.y * scale, s: scale };
   },
+  // Debug map, styled as an overhead view of a dark forest. This is ONLY a
+  // sighted-dev aid — the game is meant to be played from audio + haptics.
   _draw(headingErr, goalDist, hazProx) {
     const g = this.ctx2d, W = window.innerWidth, H = window.innerHeight;
-    g.clearRect(0, 0, W, H);
+    const t = this.elapsed;
+    const pulse = 0.5 + 0.5 * Math.sin(t * 3);   // shared 0..1 pulse for glows
 
-    // hazards (red) with damage + audible rings
-    for (const h of this.hazards) {
-      const p = this._w2s(h);
-      g.strokeStyle = 'rgba(255,80,80,.12)'; g.beginPath();
-      g.arc(p.x, p.y, CONFIG.hazardAudibleRange * p.s, 0, TAU); g.stroke();
-      g.strokeStyle = 'rgba(255,80,80,.5)'; g.beginPath();
-      g.arc(p.x, p.y, CONFIG.hazardRadius * p.s, 0, TAU); g.stroke();
-      g.fillStyle = '#ff5050'; g.beginPath(); g.arc(p.x, p.y, 7, 0, TAU); g.fill();
+    // --- Forest floor (mossy gradient) -----------------------------------
+    const bg = g.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#0c1c12'); bg.addColorStop(0.6, '#0a160e'); bg.addColorStop(1, '#08110a');
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+
+    // --- The trail you're following (player -> goal), like a route on a map
+    const pp = this._w2s(this.player), gp = this._w2s(this.goal);
+    g.save();
+    g.setLineDash([6, 10]); g.lineWidth = 3; g.strokeStyle = 'rgba(180,200,150,.20)';
+    g.beginPath();
+    const mx = (pp.x + gp.x) / 2 + (gp.y - pp.y) * 0.12;   // gentle curve
+    const my = (pp.y + gp.y) / 2 + (pp.x - gp.x) * 0.12;
+    g.moveTo(pp.x, pp.y); g.quadraticCurveTo(mx, my, gp.x, gp.y); g.stroke();
+    g.restore();
+
+    // --- Trees (decorative, drawn back-to-front) --------------------------
+    for (const tr of this.trees) this._drawTree(this._w2s(tr), tr);
+
+    // --- Monsters ---------------------------------------------------------
+    for (let i = 0; i < this.hazards.length; i++) {
+      const p = this._w2s(this.hazards[i]);
+      // faint "you can hear it" ring
+      g.strokeStyle = 'rgba(200,60,60,.06)'; g.lineWidth = 1;
+      g.beginPath(); g.arc(p.x, p.y, CONFIG.hazardAudibleRange * p.s, 0, TAU); g.stroke();
+      // maul radius
+      g.strokeStyle = 'rgba(255,70,70,.35)';
+      g.beginPath(); g.arc(p.x, p.y, CONFIG.hazardRadius * p.s, 0, TAU); g.stroke();
+      this._drawMonster(p, i, pulse);
     }
-    // goal (green) + radius
-    const gp = this._w2s(this.goal);
-    g.strokeStyle = 'rgba(106,209,154,.6)'; g.beginPath();
-    g.arc(gp.x, gp.y, CONFIG.goalRadius * gp.s, 0, TAU); g.stroke();
-    g.fillStyle = '#6ad19a'; g.beginPath(); g.arc(gp.x, gp.y, 9, 0, TAU); g.fill();
-    // player (blue) + heading whisker
-    const pp = this._w2s(this.player);
-    g.fillStyle = this.invuln > 0 ? '#ffd36a' : '#6ab0ff';
-    g.beginPath(); g.arc(pp.x, pp.y, 9, 0, TAU); g.fill();
-    g.strokeStyle = '#6ab0ff'; g.lineWidth = 3; g.beginPath();
-    g.moveTo(pp.x, pp.y);
-    g.lineTo(pp.x + Math.cos(this.heading) * 26, pp.y - Math.sin(this.heading) * 26);
-    g.stroke(); g.lineWidth = 1;
+
+    // --- Goal: a glowing magical shrine -----------------------------------
+    const glowR = (CONFIG.goalRadius * gp.s) * (1.6 + 0.25 * pulse);
+    const glow = g.createRadialGradient(gp.x, gp.y, 2, gp.x, gp.y, Math.max(8, glowR));
+    glow.addColorStop(0, 'rgba(120,255,210,.85)');
+    glow.addColorStop(0.4, 'rgba(80,200,255,.35)');
+    glow.addColorStop(1, 'rgba(80,200,255,0)');
+    g.fillStyle = glow; g.beginPath(); g.arc(gp.x, gp.y, Math.max(8, glowR), 0, TAU); g.fill();
+    // rune ring
+    g.strokeStyle = 'rgba(180,255,230,.8)'; g.lineWidth = 2;
+    g.beginPath(); g.arc(gp.x, gp.y, CONFIG.goalRadius * gp.s, 0, TAU); g.stroke();
+    g.fillStyle = '#eafff4'; g.beginPath(); g.arc(gp.x, gp.y, 5, 0, TAU); g.fill();
+
+    // --- The mage (player) + staff pointing along heading -----------------
+    const hit = this.invuln > 0 && Math.floor(t * 12) % 2 === 0;  // flash when hurt
+    const sx = pp.x + Math.cos(this.heading) * 30, sy = pp.y - Math.sin(this.heading) * 30;
+    g.strokeStyle = 'rgba(140,200,255,.85)'; g.lineWidth = 3;
+    g.beginPath(); g.moveTo(pp.x, pp.y); g.lineTo(sx, sy); g.stroke();   // staff
+    g.fillStyle = '#bfe3ff'; g.beginPath(); g.arc(sx, sy, 4 + pulse * 1.5, 0, TAU); g.fill(); // glowing tip
+    g.fillStyle = hit ? '#ff8f6a' : '#3f6fa8'; g.strokeStyle = '#bfe3ff'; g.lineWidth = 2;
+    g.beginPath(); g.arc(pp.x, pp.y, 9, 0, TAU); g.fill(); g.stroke();   // hooded mage
+    g.lineWidth = 1;
+
+    // --- Vignette (torch-lit atmosphere) ----------------------------------
+    const vg = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+    vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.55)');
+    g.fillStyle = vg; g.fillRect(0, 0, W, H);
+  },
+
+  _drawTree(p, tr) {
+    const g = this.ctx2d, size = 22 * tr.s * (p.s / 6);   // scale with map zoom
+    const h = Math.max(10, size), w = Math.max(6, size * 0.72);
+    // trunk
+    g.fillStyle = '#2e2013'; g.fillRect(p.x - w * 0.09, p.y, w * 0.18, h * 0.35);
+    // three stacked canopy tiers, slight per-tree tint
+    const shade = 26 + Math.floor(tr.tint * 22);
+    for (let k = 0; k < 3; k++) {
+      const ty = p.y - k * h * 0.28, tw = w * (1 - k * 0.22), th = h * 0.5;
+      g.fillStyle = `rgb(${18 + k * 6}, ${shade + k * 10}, ${22 + k * 6})`;
+      g.beginPath();
+      g.moveTo(p.x, ty - th); g.lineTo(p.x - tw, ty); g.lineTo(p.x + tw, ty); g.closePath(); g.fill();
+    }
+  },
+
+  _drawMonster(p, i, pulse) {
+    const g = this.ctx2d;
+    // hunched dark body
+    g.fillStyle = '#14100f';
+    g.beginPath(); g.ellipse(p.x, p.y, 11, 9, 0, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(120,30,30,.5)'; g.lineWidth = 1.5; g.stroke();
+    // two glowing eyes (colour offset per monster so they read as different beasts)
+    const hue = 8 + i * 26;
+    g.fillStyle = `hsl(${hue}, 90%, ${55 + pulse * 15}%)`;
+    g.beginPath(); g.arc(p.x - 4, p.y - 1, 2.4, 0, TAU); g.arc(p.x + 4, p.y - 1, 2.4, 0, TAU); g.fill();
+    g.lineWidth = 1;
   },
 
   _hud(headingErr, goalDist, hazProx) {
     const stateEl = document.getElementById('state');
     let txt, err = deg(headingErr);
     if (this.invuln > CONFIG.damageCooldown - 0.25) txt = '💥 DAMAGE!';
-    else if (hazProx > 0.62) txt = '⚠️ hazard near';
+    else if (hazProx > 0.62) txt = '👹 monster near';
     else if (Math.abs(err) < 12) txt = '✅ on course';
     else txt = `↪ drifting — goal to your ${err > 0 ? 'LEFT' : 'RIGHT'} (${Math.abs(err).toFixed(0)}°)`;
     stateEl.textContent = txt;

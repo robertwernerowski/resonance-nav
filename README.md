@@ -16,8 +16,10 @@ tap **Start**, and put headphones on.
   is your heading (up = forward); the **distance** is your speed. Release to stop.
 - The pure sine **resonance tone** pans toward the goal and rises in pitch as you close in.
   When it feels centred, you're pointed straight at it.
-- **Hazards** emit harsh, low, pulsing sounds panned to their position. Get too close and
-  you take damage (sound + vibration) and are shoved back. Lose all health and you fail.
+- **Monsters** lurk in the forest, each growling + rustling at its own position (panned by
+  direction, louder as you near it). Get too close and one mauls you (sound + vibration) and
+  shoves you back. Lose all health and you fail. On **Hard** the monsters *hunt* — they prowl
+  idly until they sense you, then charge.
 - Reach the goal to win.
 
 Pick **Easy / Normal / Hard** on the start screen.
